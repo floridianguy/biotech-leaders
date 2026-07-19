@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Daily biotech stock rankings">
+    <title>Biotech Leaders</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">DAILY MARKET SCREEN</p>
+        <h1>Biotech Leaders</h1>
+        <p class="subtitle">A focused view of momentum, trend confirmation, and relative strength.</p>
+      </div>
+      <div class="update-card">
+        <span>DATA REFRESHED</span>
+        <strong id="updated-at">Loading…</strong>
+      </div>
+    </header>
+
+    <main>
+      <section class="controls" aria-label="Dashboard controls">
+        <label>Trading system
+          <select id="sheet-select"></select>
+        </label>
+        <label>Show top names
+          <select id="top-n">
+            <option>5</option><option>10</option><option selected>25</option><option>50</option>
+          </select>
+        </label>
+        <label class="search">Search ticker
+          <input id="ticker-search" type="search" placeholder="e.g. MRNA" autocomplete="off">
+        </label>
+        <a class="download" href="data/biotech_rankings.xlsx" download>Download workbook</a>
+      </section>
+
+      <section class="content">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">RANKINGS</p>
+            <h2 id="table-title">Loading data…</h2>
+          </div>
+          <span id="row-count" class="row-count"></span>
+        </div>
+        <p id="summary" class="summary"></p>
+        <div id="error" class="error" role="alert" hidden></div>
+        <div class="table-wrap">
+          <table>
+            <thead id="table-head"></thead>
+            <tbody id="table-body"></tbody>
+          </table>
+        </div>
+        <p class="hint">Select a column heading to sort. Rankings are informational and are not investment advice.</p>
+      </section>
+    </main>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

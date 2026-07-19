@@ -1,0 +1,113 @@
+:root {
+  --ink: #172023;
+  --muted: #647176;
+  --paper: #f4f2ec;
+  --surface: #fffdf8;
+  --line: #d7d9d4;
+  --accent: #117864;
+  --accent-dark: #075849;
+  --warm: #e6a84b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 2rem;
+  padding: 3.5rem max(5vw, 1.25rem) 2.75rem;
+  color: white;
+  background: radial-gradient(circle at 85% 0%, #249079 0, transparent 35%), linear-gradient(120deg, #123a38, #0c292d 65%);
+  border-bottom: 5px solid var(--warm);
+}
+
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: .65rem; font-family: Georgia, serif; font-size: clamp(2.4rem, 5vw, 4.4rem); line-height: .95; }
+h2 { margin-bottom: 0; font-size: clamp(1.35rem, 3vw, 2rem); }
+.subtitle { max-width: 45rem; margin-bottom: 0; color: #c9dcd7; font-size: 1.05rem; }
+.eyebrow { margin-bottom: .65rem; color: var(--warm); font-size: .73rem; font-weight: 800; letter-spacing: .18em; }
+
+.update-card {
+  align-self: center;
+  min-width: 13rem;
+  padding: 1rem 1.2rem;
+  border: 1px solid rgba(255,255,255,.25);
+  background: rgba(0,0,0,.14);
+}
+.update-card span { display: block; margin-bottom: .3rem; color: #b7ccc7; font-size: .68rem; font-weight: 700; letter-spacing: .12em; }
+.update-card strong { font-size: .9rem; }
+
+main { padding: 0 max(5vw, 1.25rem) 3rem; }
+.controls {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(9rem, .5fr) minmax(12rem, 1fr) auto;
+  gap: 1rem;
+  align-items: end;
+  margin: -1rem 0 1.5rem;
+  padding: 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 30px rgba(22, 35, 37, .08);
+}
+label { color: var(--muted); font-size: .72rem; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+select, input {
+  width: 100%;
+  margin-top: .45rem;
+  padding: .72rem .8rem;
+  color: var(--ink);
+  background: white;
+  border: 1px solid #bcc2bf;
+  border-radius: 3px;
+  font: inherit;
+  font-size: .9rem;
+  text-transform: none;
+}
+select:focus, input:focus { outline: 2px solid #66ac9c; outline-offset: 1px; }
+.download {
+  display: inline-flex;
+  justify-content: center;
+  padding: .75rem 1rem;
+  color: white;
+  background: var(--accent);
+  border-radius: 3px;
+  font-size: .85rem;
+  font-weight: 750;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.download:hover { background: var(--accent-dark); }
+
+.content { padding: 1.5rem; background: var(--surface); border: 1px solid var(--line); }
+.section-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
+.row-count { color: var(--muted); font-size: .82rem; }
+.summary { max-width: 70rem; margin: 1rem 0 1.4rem; color: #4d5b5e; line-height: 1.6; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); }
+table { width: 100%; border-collapse: collapse; background: white; font-size: .83rem; white-space: nowrap; }
+th, td { padding: .72rem .85rem; border-bottom: 1px solid #e6e8e4; text-align: right; }
+th { position: sticky; top: 0; color: #dcebe7; background: #1a4642; font-size: .69rem; letter-spacing: .04em; text-transform: uppercase; cursor: pointer; user-select: none; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { text-align: left; }
+tbody tr:nth-child(even) { background: #f7f8f5; }
+tbody tr:hover { background: #eef6f2; }
+td:first-child { color: var(--muted); }
+td:nth-child(2) { color: var(--accent-dark); font-weight: 800; }
+.hint { margin: .8rem 0 0; color: var(--muted); font-size: .74rem; }
+.error { margin: 1rem 0; padding: 1rem; color: #721c24; background: #f8d7da; border: 1px solid #efb8bd; }
+
+@media (max-width: 850px) {
+  .hero { flex-direction: column; }
+  .update-card { align-self: flex-start; }
+  .controls { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 540px) {
+  .hero { padding-top: 2.4rem; }
+  .controls { grid-template-columns: 1fr; }
+  .content { padding: 1rem; }
+}

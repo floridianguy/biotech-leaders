@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+_site/
+.test-tmp/
+.pytest_cache/
+.agents/
+reference/
+extract_refs.py
