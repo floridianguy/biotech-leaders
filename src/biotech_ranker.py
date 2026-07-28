@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,32 @@ METHODS = {
 
 DEFAULT_START_DATE = "2021-01-01"
 LOOKBACK_DAYS = {"6m": 126, "12m": 252, "2y": 504}
+NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&download=true"
+NASDAQ_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; BiotechUniverseBuilder/1.0)",
+    "Accept": "application/json, text/plain, */*",
+}
+CORE_BIOTECH_INDUSTRIES = {
+    "biotechnology: pharmaceutical preparations",
+    "biotechnology: biological products (no diagnostic substances)",
+    "biotechnology: in vitro & in vivo diagnostic substances",
+    "biotechnology: commercial physical & biological resarch",
+    "medicinal chemicals and botanical products",
+    "misc health and biotechnology services",
+    "other pharmaceuticals",
+    "pharmaceuticals and biotechnology",
+}
+NON_COMMON_SECURITY_PATTERN = re.compile(
+    r"\b(?:warrants?|units?|rights?|senior notes?|debentures?|bonds?|"
+    r"preferred stock)\b",
+    re.IGNORECASE,
+)
+BIOTECH_COMPANY_NAME_PATTERN = re.compile(
+    r"\b(?:biotech(?:nology)?|biopharma(?:ceuticals?)?|therapeutics?|"
+    r"pharma(?:ceuticals?)?|biosciences?|biologics?|genomics?|genetics?|"
+    r"diagnostics?|life sciences?)\b",
+    re.IGNORECASE,
+)
 BIOTECH_KEYWORDS = (
     "BIOTECH",
     "BIO",
@@ -70,6 +97,65 @@ def is_biotech_candidate(name: str) -> bool:
     if any(keyword in normalized for keyword in BIOTECH_KEYWORDS):
         return True
     return "ATAI" in normalized or "ATAI" in normalized.replace("-", " ")
+
+
+def normalize_industry(industry: str) -> str:
+    return " ".join(str(industry or "").strip().lower().split())
+
+
+def is_common_equity(name: str) -> bool:
+    """Reject non-equity securities while allowing ordinary ADR/ADS shares."""
+    normalized = " ".join(str(name or "").split())
+    if not normalized:
+        return False
+    if NON_COMMON_SECURITY_PATTERN.search(normalized):
+        return False
+    return not re.search(r"\b(?:ETF|ETN|Fund|Portfolio|Index)\b", normalized, re.IGNORECASE)
+
+
+def load_universe_overrides(path: str | Path | None) -> dict[str, dict[str, str]]:
+    if not path:
+        return {}
+    override_path = Path(path)
+    if not override_path.exists():
+        return {}
+
+    frame = pd.read_csv(override_path).fillna("")
+    required = {"ticker", "action", "reason"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"Universe override file must contain columns: {', '.join(sorted(required))}")
+
+    overrides: dict[str, dict[str, str]] = {}
+    for row in frame.to_dict(orient="records"):
+        ticker = str(row["ticker"]).strip().upper()
+        action = str(row["action"]).strip().lower()
+        if not ticker:
+            continue
+        if action not in {"include", "exclude"}:
+            raise ValueError(f"Invalid universe override action for {ticker}: {action}")
+        overrides[ticker] = {"action": action, "reason": str(row["reason"]).strip()}
+    return overrides
+
+
+def classify_biotech_listing(
+    ticker: str,
+    name: str,
+    industry: str,
+    overrides: dict[str, dict[str, str]] | None = None,
+) -> tuple[bool, str]:
+    symbol = str(ticker or "").strip().upper()
+    override = (overrides or {}).get(symbol)
+    if override and override["action"] == "exclude":
+        return False, f"override exclude: {override['reason']}"
+    if not symbol or not is_common_equity(name):
+        return False, "not common equity"
+    if override and override["action"] == "include":
+        return True, f"override include: {override['reason']}"
+    if normalize_industry(industry) in CORE_BIOTECH_INDUSTRIES:
+        return True, "Nasdaq biotech/pharma industry"
+    if BIOTECH_COMPANY_NAME_PATTERN.search(name):
+        return True, "explicit biotech/life-science company name"
+    return False, "outside selected biotech/pharma industries"
 
 
 def load_tickers(csv_path: str) -> list[str]:
@@ -450,36 +536,58 @@ def write_outputs(rankings: pd.DataFrame, failures: list[tuple[str, str]], outpu
             )
 
 
-def discover_tickers(output_path: str | None = None) -> list[str]:
+def discover_tickers(
+    output_path: str | None = None,
+    overrides_path: str | Path | None = "biotech_universe_overrides.csv",
+    audit_output_path: str | None = None,
+) -> list[str]:
     try:
         import requests
     except Exception:
         return []
 
     try:
-        response = requests.get("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", timeout=20)
+        response = requests.get(NASDAQ_SCREENER_URL, headers=NASDAQ_REQUEST_HEADERS, timeout=30)
         response.raise_for_status()
+        rows = response.json()["data"]["rows"]
     except Exception:
         return []
 
-    rows = []
-    for line in response.text.splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        parts = line.split("|")
-        if len(parts) < 2:
-            continue
-        ticker = parts[0].strip()
-        name = parts[1].strip()
-        if ticker and is_biotech_candidate(name):
-            rows.append(ticker)
+    overrides = load_universe_overrides(overrides_path)
+    selected: list[str] = []
+    audit_rows: list[dict[str, str | bool]] = []
+    for row in rows:
+        ticker = str(row.get("symbol") or "").strip().upper()
+        name = str(row.get("name") or "").strip()
+        industry = str(row.get("industry") or "").strip()
+        sector = str(row.get("sector") or "").strip()
+        include, reason = classify_biotech_listing(ticker, name, industry, overrides)
+        audit_rows.append(
+            {
+                "ticker": ticker,
+                "name": name,
+                "sector": sector,
+                "industry": industry,
+                "included": include,
+                "reason": reason,
+            }
+        )
+        if include:
+            selected.append(ticker)
 
     if output_path:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({"ticker": rows}).to_csv(output_file, index=False)
+        pd.DataFrame({"ticker": sorted(set(selected))}).to_csv(output_file, index=False)
 
-    return rows
+    if audit_output_path:
+        audit_file = Path(audit_output_path)
+        audit_file.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(audit_rows).sort_values(by=["included", "ticker"], ascending=[False, True]).to_csv(
+            audit_file, index=False
+        )
+
+    return sorted(set(selected))
 
 
 def main() -> None:
@@ -489,10 +597,24 @@ def main() -> None:
     parser.add_argument("--start-date", default=DEFAULT_START_DATE, help="Start date for downloading historical data")
     parser.add_argument("--discover", action="store_true", help="Attempt to discover an automated biotech ticker universe")
     parser.add_argument("--discovered-output", default="output/discovered_tickers.csv", help="Where to save discovered tickers")
+    parser.add_argument(
+        "--universe-overrides",
+        default="biotech_universe_overrides.csv",
+        help="CSV containing explicit ticker include/exclude decisions",
+    )
+    parser.add_argument(
+        "--universe-audit-output",
+        default="output/universe_discovery_audit.csv",
+        help="Where to save the discovery classification audit",
+    )
     args = parser.parse_args()
 
     if args.discover:
-        discovered = discover_tickers(args.discovered_output)
+        discovered = discover_tickers(
+            args.discovered_output,
+            overrides_path=args.universe_overrides,
+            audit_output_path=args.universe_audit_output,
+        )
         print(f"Discovered {len(discovered)} candidate tickers")
         if discovered:
             tickers = discovered

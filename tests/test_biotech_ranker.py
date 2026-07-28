@@ -2,12 +2,15 @@ import pandas as pd
 
 from src.biotech_ranker import (
     build_method_sheets,
+    classify_biotech_listing,
     compute_period_performance,
     compute_short_term_momentum,
     compute_trend_confirmation,
     compute_volume_metrics,
     is_biotech_candidate,
+    is_common_equity,
     load_tickers,
+    load_universe_overrides,
     rank_tickers,
 )
 
@@ -40,11 +43,83 @@ def test_load_tickers_filters_blank_values(tmp_path):
     assert load_tickers(str(csv_path)) == ["AAPL", "MSFT"]
 
 
+def test_fallback_universe_contains_required_validation_tickers():
+    tickers = load_tickers("biotech_universe.csv")
+
+    assert {"GLUE", "ATAI", "ENTX"}.issubset(tickers)
+
+
 def test_is_biotech_candidate_matches_biotech_related_names():
     assert is_biotech_candidate("Gene Therapy Holdings")
     assert is_biotech_candidate("Oncology Therapeutics")
     assert is_biotech_candidate("AtaiBeckley Inc.")
     assert not is_biotech_candidate("Retail Holdings")
+
+
+def test_common_equity_filter_rejects_funds_and_other_security_types():
+    assert is_common_equity("Entera Bio Ltd. Ordinary Shares")
+    assert is_common_equity("BioNTech SE American Depositary Share")
+    assert not is_common_equity("Entera Bio Ltd. Warrants")
+    assert not is_common_equity("Vulcan Infrastructure 8.50% Senior Notes due 2026")
+    assert not is_common_equity("Example Biotechnology ETF")
+
+
+def test_classification_keeps_validation_tickers_and_rejects_false_positives():
+    overrides = {
+        "CASY": {"action": "exclude", "reason": "retailer"},
+        "DJT": {"action": "exclude", "reason": "media company"},
+        "GREEL": {"action": "exclude", "reason": "senior notes"},
+    }
+    industry = "Biotechnology: Biological Products (No Diagnostic Substances)"
+
+    for ticker in ["GLUE", "ATAI", "ENTX"]:
+        included, _ = classify_biotech_listing(ticker, f"{ticker} Common Stock", industry, overrides)
+        assert included
+
+    for ticker in ["CASY", "DJT", "GREEL"]:
+        included, _ = classify_biotech_listing(ticker, f"{ticker} Common Stock", industry, overrides)
+        assert not included
+
+
+def test_unrelated_company_name_fragments_do_not_create_candidates():
+    included, reason = classify_biotech_listing(
+        "CASY",
+        "Casey's General Stores Inc. Common Stock",
+        "Retail-Auto Dealers and Gas Stations",
+    )
+
+    assert not included
+    assert reason == "outside selected biotech/pharma industries"
+
+
+def test_complete_biotech_terms_recover_misclassified_companies():
+    examples = [
+        ("BNR", "Burning Rock Biotech Limited American Depositary Shares"),
+        ("CUVL", "Clinuvel Pharmaceuticals Limited American Depositary Shares"),
+        ("CODX", "Co-Diagnostics Inc. Common Stock"),
+        ("ANIK", "Anika Therapeutics Inc. Common Stock"),
+    ]
+
+    for ticker, name in examples:
+        included, reason = classify_biotech_listing(ticker, name, "Medical Specialities")
+        assert included
+        assert reason == "explicit biotech/life-science company name"
+
+
+def test_load_universe_overrides_validates_and_normalizes_rows(tmp_path):
+    path = tmp_path / "overrides.csv"
+    pd.DataFrame(
+        {
+            "ticker": [" glue ", "djt"],
+            "action": [" INCLUDE ", "exclude"],
+            "reason": ["biotech", "media"],
+        }
+    ).to_csv(path, index=False)
+
+    overrides = load_universe_overrides(path)
+
+    assert overrides["GLUE"]["action"] == "include"
+    assert overrides["DJT"]["reason"] == "media"
 
 
 def test_compute_volume_metrics_returns_recent_and_average_volume():

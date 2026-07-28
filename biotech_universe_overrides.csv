@@ -1,0 +1,36 @@
+ticker,action,reason
+GLUE,include,Validated clinical-stage biotechnology company
+ATAI,include,Validated clinical-stage biotechnology company
+ENTX,include,Validated clinical-stage biopharmaceutical company
+BHST,include,Plant-cell biotechnology platform
+CAMP,include,RNA-targeted therapeutics company
+NGEN,include,Clinical-stage biotechnology company
+SILO,include,Clinical-stage biopharmaceutical company
+BIOX,include,Agricultural biotechnology company
+EVGN,include,Computational biology and agricultural biotechnology company
+BLFS,include,Cell and gene therapy biopreservation tools
+BNGO,include,Genomics platform company
+CTKB,include,Cell-analysis life-science platform
+HBIO,include,Life-science research instruments
+LAB,include,Life-science research and bioanalysis platform
+NAUT,include,Proteomics biotechnology platform
+PACB,include,Genomics sequencing platform
+RPID,include,Microbial quality-control life-science platform
+BBLG,include,Biologics and regenerative medicine company
+CLGN,include,Regenerative and aesthetic medicine biotechnology company
+BRTX,include,Cell-therapy biotechnology company
+BDSX,include,Lung-disease diagnostics company
+BGLC,include,Molecular diagnostics and laboratory company
+CAI,include,Molecular profiling and precision-medicine company
+CSTL,include,Molecular diagnostics company
+FLGT,include,Genetic testing and diagnostics company
+GH,include,Precision-oncology diagnostics company
+MDXH,include,Molecular diagnostics company
+TLSI,include,Oncology drug-delivery and immunotherapy company
+VRDN,include,Clinical-stage biotechnology company
+WGS,include,Genomics and genetic diagnostics company
+INO,include,DNA-medicine biotechnology company
+PSTV,include,Clinical-stage oncology therapeutics company
+CASY,exclude,Convenience-store and fuel retailer
+DJT,exclude,Media and technology company
+GREEL,exclude,Senior-note security issued by a power and datacenter company

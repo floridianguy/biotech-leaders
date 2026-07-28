@@ -6,12 +6,24 @@ This project downloads historical stock prices, ranks biotech stocks using three
 
 The workflow in `.github/workflows/deploy-pages.yml` runs automatically at 23:17 UTC every weekday and can also be started manually. It:
 
-1. Discovers a biotech ticker universe, falling back to `biotech_universe.csv` if discovery is unavailable.
+1. Discovers common-stock biotech and pharmaceutical companies from Nasdaq's
+   industry classifications, applies the documented decisions in
+   `biotech_universe_overrides.csv`, and falls back to `biotech_universe.csv`
+   if discovery is unavailable.
 2. Generates `output/biotech_rankings.xlsx`.
 3. Converts the dashboard sheets to browser-friendly JSON.
 4. Deploys the static site and downloadable workbook as a GitHub Pages artifact.
 
 Generated rankings are not committed to repository history.
+
+The discovery job also writes `output/universe_discovery_audit.csv`, which
+records every Nasdaq screener row, its classification, and the reason it was
+included or excluded. ETFs, funds, warrants, units, rights, notes, bonds, and
+preferred shares are excluded. Whole company-name terms such as
+`Therapeutics`, `Biotechnology`, `Pharmaceuticals`, `Genomics`, and
+`Diagnostics` recover legitimate companies with unusually broad exchange
+industry classifications; partial fragments such as `GENE` and `MED` are not
+used.
 
 ## Enable GitHub Pages
 
