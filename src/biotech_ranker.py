@@ -17,6 +17,10 @@ METHODS = {
 
 DEFAULT_START_DATE = "2021-01-01"
 LOOKBACK_DAYS = {"6m": 126, "12m": 252, "2y": 504}
+MAX_DAILY_GAIN_PCT = 400.0
+MAX_DAILY_LOSS_PCT = -85.0
+MAX_SHORT_WINDOW_RETURN_PCT = 500.0
+SPLIT_MATCH_FACTOR_TOLERANCE = 1.75
 NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&download=true"
 NASDAQ_REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; BiotechUniverseBuilder/1.0)",
@@ -167,18 +171,143 @@ def load_tickers(csv_path: str) -> list[str]:
     return [ticker for ticker in tickers if ticker]
 
 
+def normalize_split_history(history: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Put raw OHLC and volume on the latest share scale using verified split events."""
+    normalized = history.copy()
+    price_columns = [column for column in ["Open", "High", "Low", "Close"] if column in normalized.columns]
+    for column in price_columns + (["Volume"] if "Volume" in normalized.columns else []):
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce").astype(float)
+    split_events = (
+        pd.to_numeric(normalized.get("Stock Splits", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0.0)
+    )
+    event_rows = [(index, float(ratio)) for index, ratio in split_events.items() if ratio > 0]
+    applied: list[str] = []
+    ignored: list[str] = []
+    unresolved: list[str] = []
+
+    if "Close" not in normalized.columns:
+        return normalized, {
+            "split_events_detected": len(event_rows),
+            "split_adjustment_applied": False,
+            "split_adjustments": "",
+            "unresolved_split_events": "missing Close column",
+        }
+
+    # Later splits must be normalized first so earlier split continuity is
+    # evaluated on a consistent share scale.
+    for event_date, ratio in reversed(event_rows):
+        close = pd.to_numeric(normalized["Close"], errors="coerce")
+        before = close.loc[close.index < event_date].dropna()
+        after = close.loc[close.index >= event_date].dropna()
+        label = f"{pd.Timestamp(event_date).date().isoformat()} ({ratio:g})"
+        if before.empty or after.empty:
+            unresolved.append(f"{label}: missing surrounding prices")
+            continue
+
+        observed_ratio = float(after.iloc[0] / before.iloc[-1])
+        expected_ratio = 1.0 / ratio
+        if observed_ratio <= 0 or expected_ratio <= 0:
+            unresolved.append(f"{label}: invalid price ratio")
+            continue
+
+        expected_distance = abs(float(np.log(observed_ratio / expected_ratio)))
+        inverse_distance = abs(float(np.log(observed_ratio / ratio)))
+        continuity_distance = abs(float(np.log(observed_ratio)))
+        tolerance = float(np.log(SPLIT_MATCH_FACTOR_TOLERANCE))
+
+        if expected_distance <= tolerance and expected_distance < continuity_distance:
+            price_multiplier = expected_ratio
+            for column in price_columns:
+                normalized.loc[normalized.index < event_date, column] = (
+                    pd.to_numeric(normalized.loc[normalized.index < event_date, column], errors="coerce")
+                    * price_multiplier
+                )
+            if "Volume" in normalized.columns:
+                normalized.loc[normalized.index < event_date, "Volume"] = (
+                    pd.to_numeric(normalized.loc[normalized.index < event_date, "Volume"], errors="coerce")
+                    * ratio
+                )
+            applied.append(label)
+        elif inverse_distance <= tolerance and inverse_distance < continuity_distance:
+            # Some feeds encode a postponed or duplicate split in the historical
+            # series as an inverse discontinuity. Re-scale the earlier history
+            # to continuity while retaining the event in the audit trail.
+            price_multiplier = ratio
+            for column in price_columns:
+                normalized.loc[normalized.index < event_date, column] = (
+                    normalized.loc[normalized.index < event_date, column] * price_multiplier
+                )
+            if "Volume" in normalized.columns:
+                normalized.loc[normalized.index < event_date, "Volume"] = (
+                    normalized.loc[normalized.index < event_date, "Volume"] / ratio
+                )
+            applied.append(f"{label} inverse correction")
+        elif continuity_distance <= tolerance:
+            ignored.append(f"{label}: prices already continuous")
+        else:
+            unresolved.append(
+                f"{label}: observed {observed_ratio:.2f}x, expected {expected_ratio:.2f}x"
+            )
+
+    return normalized, {
+        "split_events_detected": len(event_rows),
+        "split_adjustment_applied": bool(applied),
+        "split_adjustments": "; ".join(reversed(applied)),
+        "ignored_split_events": "; ".join(reversed(ignored)),
+        "unresolved_split_events": "; ".join(reversed(unresolved)),
+    }
+
+
+def evaluate_price_quality(history: pd.DataFrame, split_info: dict[str, object]) -> dict[str, object]:
+    close = pd.to_numeric(history.get("Close", pd.Series(dtype=float)), errors="coerce").dropna()
+    daily_returns = close.pct_change().dropna() * 100
+    max_daily_gain = float(daily_returns.max()) if not daily_returns.empty else float("nan")
+    max_daily_loss = float(daily_returns.min()) if not daily_returns.empty else float("nan")
+    reasons: list[str] = []
+
+    unresolved = str(split_info.get("unresolved_split_events") or "").strip()
+    if unresolved:
+        reasons.append(f"unresolved split: {unresolved}")
+    if np.isfinite(max_daily_gain) and max_daily_gain > MAX_DAILY_GAIN_PCT:
+        reasons.append(f"one-day gain {max_daily_gain:.1f}% exceeds {MAX_DAILY_GAIN_PCT:.0f}%")
+    if np.isfinite(max_daily_loss) and max_daily_loss < MAX_DAILY_LOSS_PCT:
+        reasons.append(f"one-day loss {max_daily_loss:.1f}% exceeds {abs(MAX_DAILY_LOSS_PCT):.0f}%")
+
+    for days in [10, 15, 30]:
+        if len(close) <= days:
+            continue
+        start = float(close.iloc[-days - 1])
+        if start == 0:
+            continue
+        window_return = ((float(close.iloc[-1]) / start) - 1) * 100
+        if abs(window_return) > MAX_SHORT_WINDOW_RETURN_PCT:
+            reasons.append(
+                f"{days}-day return {window_return:.1f}% exceeds ±{MAX_SHORT_WINDOW_RETURN_PCT:.0f}%"
+            )
+
+    return {
+        "data_quality_flag": bool(reasons),
+        "data_quality_reason": "; ".join(reasons),
+        "max_daily_gain": max_daily_gain,
+        "max_daily_loss": max_daily_loss,
+        **split_info,
+    }
+
+
 def fetch_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
-    history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True, actions=False)
+    history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False, actions=True)
     if isinstance(history, pd.DataFrame) and not history.empty:
-        if "Close" in history.columns:
-            return history.dropna(subset=["Close"])
         if isinstance(history.columns, pd.MultiIndex):
             close_keys = [col for col in history.columns if col[0] == "Close"]
             if close_keys:
                 history = history.copy()
                 history.columns = [col[0] if isinstance(col, tuple) else col for col in history.columns]
-                return history.dropna(subset=["Close"])
-    return pd.DataFrame(columns=["Close", "High", "Low", "Open", "Volume"])
+        if "Close" in history.columns:
+            normalized, split_info = normalize_split_history(history)
+            normalized.attrs["price_quality"] = evaluate_price_quality(normalized, split_info)
+            return normalized.dropna(subset=["Close"])
+    return pd.DataFrame(columns=["Close", "High", "Low", "Open", "Volume", "Stock Splits"])
 
 
 def compute_volume_metrics(volume_series: pd.Series, lookback_days: int) -> dict[str, float]:
@@ -365,6 +494,7 @@ def build_rankings(tickers: list[str], start_date: str = DEFAULT_START_DATE, end
 
             latest = close_series.iloc[-1]
             indicators = compute_indicators(history)
+            quality = history.attrs.get("price_quality", evaluate_price_quality(history, {}))
             results.append(
                 {
                     "ticker": ticker,
@@ -385,6 +515,13 @@ def build_rankings(tickers: list[str], start_date: str = DEFAULT_START_DATE, end
                     "short_momentum_score": round(float(indicators["short_momentum_score"]), 2),
                     "trend_confirmed": bool(indicators["trend_confirmed"]),
                     "trend_confirmed_on": indicators["trend_confirmed_on"].strftime("%Y-%m-%d") if pd.notna(indicators["trend_confirmed_on"]) else None,
+                    "data_quality_flag": bool(quality["data_quality_flag"]),
+                    "data_quality_reason": str(quality["data_quality_reason"]),
+                    "split_events_detected": int(quality.get("split_events_detected", 0)),
+                    "split_adjustment_applied": bool(quality.get("split_adjustment_applied", False)),
+                    "split_adjustments": str(quality.get("split_adjustments", "")),
+                    "max_daily_gain": round(float(quality["max_daily_gain"]), 2),
+                    "max_daily_loss": round(float(quality["max_daily_loss"]), 2),
                     "latest_price": round(float(latest), 2),
                     "6m": round(compute_period_performance(close_series.iloc[-LOOKBACK_DAYS["6m"] :], LOOKBACK_DAYS["6m"]), 2),
                     "12m": round(compute_period_performance(close_series.iloc[-LOOKBACK_DAYS["12m"] :], LOOKBACK_DAYS["12m"]), 2),
@@ -413,6 +550,13 @@ def build_rankings(tickers: list[str], start_date: str = DEFAULT_START_DATE, end
                 "short_momentum_score",
                 "trend_confirmed",
                 "trend_confirmed_on",
+                "data_quality_flag",
+                "data_quality_reason",
+                "split_events_detected",
+                "split_adjustment_applied",
+                "split_adjustments",
+                "max_daily_gain",
+                "max_daily_loss",
                 "latest_price",
                 "6m",
                 "12m",
@@ -428,11 +572,17 @@ def build_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     momentum = rankings.copy()
     if not momentum.empty:
+        if "data_quality_flag" not in momentum.columns:
+            momentum["data_quality_flag"] = False
+        else:
+            momentum["data_quality_flag"] = momentum["data_quality_flag"].fillna(False).astype(bool)
         momentum["short_momentum_score"] = momentum["short_momentum_score"] if "short_momentum_score" in momentum.columns else pd.Series(0.0, index=momentum.index)
         momentum["short_return_10d"] = momentum["short_return_10d"] if "short_return_10d" in momentum.columns else pd.Series(0.0, index=momentum.index)
         momentum["short_return_15d"] = momentum["short_return_15d"] if "short_return_15d" in momentum.columns else pd.Series(0.0, index=momentum.index)
         momentum["momentum_score"] = 0.5 * momentum["short_momentum_score"] + 0.35 * momentum["short_return_10d"] + 0.15 * momentum["short_return_15d"]
-        momentum = momentum.sort_values(by="momentum_score", ascending=False).reset_index(drop=True)
+        momentum = momentum.sort_values(
+            by=["data_quality_flag", "momentum_score"], ascending=[True, False]
+        ).reset_index(drop=True)
         momentum["method"] = METHODS["MomentumLeader"]
         selected_columns = [
             "ticker",
@@ -450,16 +600,26 @@ def build_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "slope_50",
             "slope_200",
             "volume_1p5x",
+            "split_adjustment_applied",
+            "data_quality_flag",
+            "data_quality_reason",
         ]
         selected_columns = [column for column in selected_columns if column in momentum.columns]
         frames["MomentumLeader"] = momentum[selected_columns]
 
     trend = rankings.copy()
     if not trend.empty:
+        if "data_quality_flag" not in trend.columns:
+            trend["data_quality_flag"] = False
+        else:
+            trend["data_quality_flag"] = trend["data_quality_flag"].fillna(False).astype(bool)
         trend["trend_confirmed"] = trend["trend_confirmed"] if "trend_confirmed" in trend.columns else pd.Series(False, index=trend.index)
         trend["trend_confirmed_on"] = trend["trend_confirmed_on"] if "trend_confirmed_on" in trend.columns else pd.Series(pd.NaT, index=trend.index)
         trend["trend_flag"] = ((trend["closing_price"] > trend["sma_50"]) & (trend["sma_50"] > trend["sma_200"]) & (trend["slope_50"] > 0) & (trend["slope_200"] > 0)).astype(int)
-        trend = trend.sort_values(by=["trend_flag", "trend_confirmed", "6m", "12m", "2y"], ascending=[False, False, False, False, False]).reset_index(drop=True)
+        trend = trend.sort_values(
+            by=["data_quality_flag", "trend_flag", "trend_confirmed", "6m", "12m", "2y"],
+            ascending=[True, False, False, False, False, False],
+        ).reset_index(drop=True)
         trend["method"] = METHODS["TrendConfirmation"]
         selected_columns = [
             "ticker",
@@ -477,25 +637,41 @@ def build_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "slope_50",
             "slope_200",
             "volume_1p5x",
+            "split_adjustment_applied",
+            "data_quality_flag",
+            "data_quality_reason",
         ]
         selected_columns = [column for column in selected_columns if column in trend.columns]
         frames["TrendConfirmation"] = trend[selected_columns]
 
     relative = rankings.copy()
     if not relative.empty:
-        universe_median_6m = relative["6m"].median()
-        universe_median_12m = relative["12m"].median()
-        universe_median_2y = relative["2y"].median()
+        if "data_quality_flag" not in relative.columns:
+            relative["data_quality_flag"] = False
+        else:
+            relative["data_quality_flag"] = relative["data_quality_flag"].fillna(False).astype(bool)
+        clean_relative = relative.loc[~relative["data_quality_flag"]]
+        median_source = clean_relative if not clean_relative.empty else relative
+        universe_median_6m = median_source["6m"].median()
+        universe_median_12m = median_source["12m"].median()
+        universe_median_2y = median_source["2y"].median()
         relative["relative_strength"] = (
             (relative["6m"] - universe_median_6m) / abs(universe_median_6m + 1e-9)
             + (relative["12m"] - universe_median_12m) / abs(universe_median_12m + 1e-9)
             + (relative["2y"] - universe_median_2y) / abs(universe_median_2y + 1e-9)
         )
-        relative = relative.sort_values(by="relative_strength", ascending=False).reset_index(drop=True)
+        relative = relative.sort_values(
+            by=["data_quality_flag", "relative_strength"], ascending=[True, False]
+        ).reset_index(drop=True)
         relative["method"] = METHODS["RelativeStrength"]
-        frames["RelativeStrength"] = relative[
-            ["ticker", "method", "relative_strength", "6m", "12m", "2y", "closing_price", "sma_50", "sma_200", "slope_50", "slope_200", "volume_1p5x"]
+        selected_columns = [
+            "ticker", "method", "relative_strength", "6m", "12m", "2y",
+            "closing_price", "sma_50", "sma_200", "slope_50", "slope_200",
+            "volume_1p5x", "split_adjustment_applied", "data_quality_flag",
+            "data_quality_reason",
         ]
+        selected_columns = [column for column in selected_columns if column in relative.columns]
+        frames["RelativeStrength"] = relative[selected_columns]
 
     return frames
 
@@ -523,6 +699,13 @@ def write_outputs(rankings: pd.DataFrame, failures: list[tuple[str, str]], outpu
             method_frames = build_method_sheets(rankings)
             for method_name, method_frame in method_frames.items():
                 method_frame.to_excel(writer, sheet_name=method_name, index=False)
+
+            if not rankings.empty and "data_quality_flag" in rankings.columns:
+                review_mask = (
+                    rankings["data_quality_flag"].fillna(False).astype(bool)
+                    | rankings["split_adjustment_applied"].fillna(False).astype(bool)
+                )
+                rankings.loc[review_mask].to_excel(writer, sheet_name="DataQualityReview", index=False)
 
             if failures:
                 pd.DataFrame({"ticker": [ticker for ticker, _ in failures], "error": [message for _, message in failures]}).to_excel(

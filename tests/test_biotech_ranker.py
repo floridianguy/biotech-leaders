@@ -7,10 +7,12 @@ from src.biotech_ranker import (
     compute_short_term_momentum,
     compute_trend_confirmation,
     compute_volume_metrics,
+    evaluate_price_quality,
     is_biotech_candidate,
     is_common_equity,
     load_tickers,
     load_universe_overrides,
+    normalize_split_history,
     rank_tickers,
 )
 
@@ -131,6 +133,109 @@ def test_compute_volume_metrics_returns_recent_and_average_volume():
     assert abs(result["avg_volume_15d"] - 250.0) < 1e-9
 
 
+def make_split_history(
+    pre_split_prices: list[float],
+    post_split_prices: list[float],
+    split_ratio: float,
+) -> pd.DataFrame:
+    dates = pd.date_range("2026-01-01", periods=len(pre_split_prices) + len(post_split_prices) + 1, freq="B")
+    prices = pre_split_prices + [float("nan")] + post_split_prices
+    split_values = [0.0] * len(prices)
+    split_values[len(pre_split_prices)] = split_ratio
+    return pd.DataFrame(
+        {
+            "Open": prices,
+            "High": prices,
+            "Low": prices,
+            "Close": prices,
+            "Volume": [1000.0] * len(prices),
+            "Stock Splits": split_values,
+        },
+        index=dates,
+    )
+
+
+def test_reverse_split_normalization_removes_artificial_jump():
+    history = make_split_history([0.60, 0.64], [6.30, 8.00], 0.1)
+
+    normalized, info = normalize_split_history(history)
+
+    assert info["split_adjustment_applied"] is True
+    assert normalized["Close"].dropna().tolist() == [6.0, 6.4, 6.3, 8.0]
+    assert normalized["Volume"].dropna().iloc[0] == 100.0
+
+
+def test_forward_split_normalization_uses_latest_share_scale():
+    history = make_split_history([100.0, 102.0], [51.0, 52.0], 2.0)
+
+    normalized, info = normalize_split_history(history)
+
+    assert info["split_adjustment_applied"] is True
+    assert normalized["Close"].dropna().tolist() == [50.0, 51.0, 51.0, 52.0]
+    assert normalized["Volume"].dropna().iloc[0] == 2000.0
+
+
+def test_already_adjusted_or_postponed_split_is_not_applied_twice():
+    history = make_split_history([6.0, 6.4], [6.3, 8.0], 0.1)
+
+    normalized, info = normalize_split_history(history)
+
+    assert info["split_adjustment_applied"] is False
+    assert "prices already continuous" in info["ignored_split_events"]
+    assert normalized["Close"].dropna().tolist() == [6.0, 6.4, 6.3, 8.0]
+
+
+def test_inverse_split_discontinuity_is_reconciled():
+    history = make_split_history([60.0, 64.0], [6.3, 8.0], 0.1)
+
+    normalized, info = normalize_split_history(history)
+
+    assert info["split_adjustment_applied"] is True
+    assert "inverse correction" in info["split_adjustments"]
+    assert normalized["Close"].dropna().tolist() == [6.0, 6.4, 6.3, 8.0]
+
+
+def test_multiple_split_records_are_normalized_latest_first():
+    dates = pd.date_range("2026-01-01", periods=8, freq="B")
+    history = pd.DataFrame(
+        {
+            "Open": [60.0, 64.0, float("nan"), 6.3, 0.8, 0.64, float("nan"), 8.0],
+            "High": [60.0, 64.0, float("nan"), 6.3, 0.8, 0.64, float("nan"), 8.0],
+            "Low": [60.0, 64.0, float("nan"), 6.3, 0.8, 0.64, float("nan"), 8.0],
+            "Close": [60.0, 64.0, float("nan"), 6.3, 0.8, 0.64, float("nan"), 8.0],
+            "Volume": [1000.0] * 8,
+            "Stock Splits": [0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1, 0.0],
+        },
+        index=dates,
+    )
+
+    normalized, info = normalize_split_history(history)
+
+    assert info["split_events_detected"] == 2
+    assert info["split_adjustment_applied"] is True
+    assert normalized["Close"].dropna().tolist() == [60.0, 64.0, 63.0, 8.0, 6.4, 8.0]
+
+
+def test_data_quality_flags_implausible_unexplained_move():
+    dates = pd.date_range("2026-01-01", periods=40, freq="B")
+    history = pd.DataFrame({"Close": [1.0] * 39 + [10.0]}, index=dates)
+
+    quality = evaluate_price_quality(history, {})
+
+    assert quality["data_quality_flag"] is True
+    assert "one-day gain" in quality["data_quality_reason"]
+    assert "10-day return" in quality["data_quality_reason"]
+
+
+def test_data_quality_allows_large_but_plausible_biotech_gap():
+    dates = pd.date_range("2026-01-01", periods=40, freq="B")
+    history = pd.DataFrame({"Close": [10.0] * 39 + [30.0]}, index=dates)
+
+    quality = evaluate_price_quality(history, {})
+
+    assert quality["data_quality_flag"] is False
+
+
 def test_build_method_sheets_retains_volume_flag():
     rankings = pd.DataFrame(
         {
@@ -152,6 +257,38 @@ def test_build_method_sheets_retains_volume_flag():
     assert "volume_1p5x" in frames["MomentumLeader"].columns
     assert "volume_1p5x" in frames["TrendConfirmation"].columns
     assert "volume_1p5x" in frames["RelativeStrength"].columns
+
+
+def test_flagged_data_sorts_below_clean_data_in_every_method():
+    rankings = pd.DataFrame(
+        {
+            "ticker": ["FLAGGED", "CLEAN"],
+            "closing_price": [200.0, 100.0],
+            "sma_50": [100.0, 90.0],
+            "sma_200": [80.0, 80.0],
+            "slope_50": [1.0, 1.0],
+            "slope_200": [1.0, 1.0],
+            "6m": [1000.0, 10.0],
+            "12m": [1000.0, 10.0],
+            "2y": [1000.0, 10.0],
+            "short_momentum_score": [1000.0, 10.0],
+            "short_return_10d": [1000.0, 10.0],
+            "short_return_15d": [1000.0, 10.0],
+            "short_return_30d": [1000.0, 10.0],
+            "trend_confirmed": [True, True],
+            "trend_confirmed_on": ["2026-01-01", "2026-01-01"],
+            "volume_1p5x": [True, False],
+            "data_quality_flag": [True, False],
+            "data_quality_reason": ["implausible return", ""],
+            "split_adjustment_applied": [False, False],
+        }
+    )
+
+    frames = build_method_sheets(rankings)
+
+    assert frames["MomentumLeader"].iloc[0]["ticker"] == "CLEAN"
+    assert frames["TrendConfirmation"].iloc[0]["ticker"] == "CLEAN"
+    assert frames["RelativeStrength"].iloc[0]["ticker"] == "CLEAN"
 
 
 def test_compute_short_term_momentum_returns_expected_values():
