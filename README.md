@@ -16,6 +16,14 @@ The workflow in `.github/workflows/deploy-pages.yml` runs automatically at 23:17
 
 Generated rankings are not committed to repository history.
 
+Raw Yahoo price history is normalized against reported stock-split events
+before any return, RSI, ATR, or moving-average calculation. The output includes
+split-audit and data-quality fields. Histories with unresolved corporate
+actions, a one-day gain above 400%, a one-day loss below -85%, or an absolute
+10-, 15-, or 30-day return above 500% are retained for review but sorted below
+clean data in every ranking. The workbook's `DataQualityReview` sheet contains
+both flagged histories and successfully normalized split histories.
+
 The discovery job also writes `output/universe_discovery_audit.csv`, which
 records every Nasdaq screener row, its classification, and the reason it was
 included or excluded. ETFs, funds, warrants, units, rights, notes, bonds, and
