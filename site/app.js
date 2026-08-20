@@ -36,10 +36,16 @@ function render() {
   const section = state.data.sheets[state.sheet];
   const query = elements.search.value.trim().toUpperCase();
   const limit = Number(elements.topN.value);
-  let rows = section.rows.filter((row) => !query || String(row.ticker || "").toUpperCase().includes(query));
+  // Capture the production rank before searching, sorting, or limiting the table.
+  // Otherwise a ticker search that returns one row would always display rank 1.
+  let rows = section.rows
+    .map((row, index) => ({ row, currentRank: index + 1 }))
+    .filter(({ row }) => !query || String(row.ticker || "").toUpperCase().includes(query));
 
   if (state.sortKey) {
-    rows = [...rows].sort((a, b) => compareValues(a[state.sortKey], b[state.sortKey]) * (state.ascending ? 1 : -1));
+    rows = [...rows].sort(
+      (a, b) => compareValues(a.row[state.sortKey], b.row[state.sortKey]) * (state.ascending ? 1 : -1)
+    );
   }
   rows = rows.slice(0, limit);
 
@@ -66,9 +72,9 @@ function render() {
   });
   elements.head.appendChild(headerRow);
 
-  rows.forEach((row, index) => {
+  rows.forEach(({ row, currentRank }) => {
     const tr = document.createElement("tr");
-    [["Rank", index + 1], ...columns.map((column) => [column, row[column]])].forEach(([column, value]) => {
+    [["Rank", currentRank], ...columns.map((column) => [column, row[column]])].forEach(([column, value]) => {
       const td = document.createElement("td");
       td.textContent = displayValue(value, column);
       tr.appendChild(td);
