@@ -11,6 +11,8 @@ The workflow in `.github/workflows/deploy-pages.yml` runs automatically at 23:17
    `biotech_universe_overrides.csv`, and falls back to `biotech_universe.csv`
    if discovery is unavailable.
 2. Generates `output/biotech_rankings.xlsx`.
+   It also generates `output/biotech_rankings_shadow.xlsx`, which preserves the
+   prior-system ranks beside the production ranks for comparison.
 3. Converts the dashboard sheets to browser-friendly JSON.
 4. Deploys the static site and downloadable workbook as a GitHub Pages artifact.
 
@@ -32,6 +34,18 @@ preferred shares are excluded. Whole company-name terms such as
 `Diagnostics` recover legitimate companies with unusually broad exchange
 industry classifications; partial fragments such as `GENE` and `MED` are not
 used.
+
+## Entry-quality ranking and comparison workbook
+
+The production lists use the adjusted ranking system. The shadow workbook
+preserves the previous-system rank beside the new rank for comparison. It
+includes 20-day median dollar-volume and share-price
+adjustments, recent normalized moving-average slopes, a persistent/fresh trend
+confirmation, percentile-based 1-, 3-, 6-, and 12-month relative strength,
+RSI direction, ATR-based extension measurements, and a constructive-pullback
+indicator. Each production sheet exposes its base score, gross penalties,
+liquidity bonus, and total net adjustment. Risk-to-reward scoring is
+intentionally deferred.
 
 ## Enable GitHub Pages
 

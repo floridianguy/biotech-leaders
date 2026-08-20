@@ -16,7 +16,17 @@ METHODS = {
 }
 
 DEFAULT_START_DATE = "2021-01-01"
-LOOKBACK_DAYS = {"6m": 126, "12m": 252, "2y": 504}
+LOOKBACK_DAYS = {"1m": 21, "3m": 63, "6m": 126, "12m": 252, "2y": 504}
+LIQUIDITY_LOOKBACK_DAYS = 20
+SLOPE_50_LOOKBACK_DAYS = 20
+SLOPE_200_LOOKBACK_DAYS = 40
+TREND_RISING_DAYS_REQUIRED = 15
+TREND_RISING_WINDOW_DAYS = 20
+TREND_CONFIRMATION_DAYS = 5
+TREND_RECLAIM_MAX_DAYS = 10
+PULLBACK_LOOKBACK_DAYS = 50
+PULLBACK_MIN_ATR = 3.0
+PULLBACK_MAX_CLOSES_BELOW_SMA_200 = 3
 MAX_DAILY_GAIN_PCT = 400.0
 MAX_DAILY_LOSS_PCT = -85.0
 MAX_SHORT_WINDOW_RETURN_PCT = 500.0
@@ -310,9 +320,19 @@ def fetch_price_history(ticker: str, start: str, end: str) -> pd.DataFrame:
     return pd.DataFrame(columns=["Close", "High", "Low", "Open", "Volume", "Stock Splits"])
 
 
-def compute_volume_metrics(volume_series: pd.Series, lookback_days: int) -> dict[str, float]:
+def compute_volume_metrics(
+    volume_series: pd.Series,
+    lookback_days: int,
+    close_series: pd.Series | None = None,
+) -> dict[str, float]:
     if volume_series.empty:
-        return {"latest_volume": float("nan"), "avg_volume_15d": float("nan")}
+        return {
+            "latest_volume": float("nan"),
+            "avg_volume_15d": float("nan"),
+            "mean_volume_20d": float("nan"),
+            "median_volume_20d": float("nan"),
+            "median_dollar_volume_20d": float("nan"),
+        }
 
     latest_volume = float(volume_series.iloc[-1])
     if len(volume_series) < lookback_days:
@@ -320,7 +340,91 @@ def compute_volume_metrics(volume_series: pd.Series, lookback_days: int) -> dict
     else:
         avg_volume_15d = float(volume_series.iloc[-lookback_days:].mean())
 
-    return {"latest_volume": latest_volume, "avg_volume_15d": avg_volume_15d}
+    volume_20d = volume_series.iloc[-LIQUIDITY_LOOKBACK_DAYS:]
+    mean_volume_20d = float(volume_20d.mean())
+    median_volume_20d = float(volume_20d.median())
+    median_dollar_volume_20d = float("nan")
+    if close_series is not None:
+        aligned = pd.concat(
+            [
+                pd.to_numeric(close_series, errors="coerce").rename("close"),
+                pd.to_numeric(volume_series, errors="coerce").rename("volume"),
+            ],
+            axis=1,
+        ).dropna().iloc[-LIQUIDITY_LOOKBACK_DAYS:]
+        if not aligned.empty:
+            median_dollar_volume_20d = float((aligned["close"] * aligned["volume"]).median())
+
+    return {
+        "latest_volume": latest_volume,
+        "avg_volume_15d": avg_volume_15d,
+        "mean_volume_20d": mean_volume_20d,
+        "median_volume_20d": median_volume_20d,
+        "median_dollar_volume_20d": median_dollar_volume_20d,
+    }
+
+
+def compute_normalized_slope(series: pd.Series, lookback_days: int) -> float:
+    values = pd.to_numeric(series, errors="coerce").dropna().iloc[-lookback_days:]
+    if len(values) < 2:
+        return float("nan")
+    average = float(values.mean())
+    if average == 0:
+        return float("nan")
+    slope = float(np.polyfit(np.arange(len(values)), values.to_numpy(), 1)[0])
+    return slope / average * 100
+
+
+def compute_raw_slope(series: pd.Series) -> float:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if len(values) < 2:
+        return float("nan")
+    return float(np.polyfit(np.arange(len(values)), values.to_numpy(), 1)[0])
+
+
+def liquidity_score_adjustment(median_dollar_volume: float) -> float:
+    if not np.isfinite(median_dollar_volume):
+        return -8.0
+    if median_dollar_volume < 100_000:
+        return -8.0
+    if median_dollar_volume < 500_000:
+        return -3.0
+    if median_dollar_volume <= 2_000_000:
+        return 0.0
+    return 2.0
+
+
+def price_score_adjustment(price: float) -> float:
+    if not np.isfinite(price) or price < 1:
+        return -8.0
+    if price < 3:
+        return -4.0
+    if price < 5:
+        return -2.0
+    return 0.0
+
+
+def rsi_score_penalty(rsi: float, rsi_change_5d: float) -> float:
+    if not np.isfinite(rsi) or rsi < 75:
+        return 0.0
+    if rsi < 80:
+        penalty = -1.0
+    elif rsi < 85:
+        penalty = -3.0
+    else:
+        penalty = -5.0
+    # Cooling momentum remains extended, but receives half the penalty.
+    return penalty if not np.isfinite(rsi_change_5d) or rsi_change_5d >= 0 else penalty / 2
+
+
+def tiered_extension_penalty(value: float) -> float:
+    if not np.isfinite(value) or value <= 4:
+        return 0.0
+    if value <= 6:
+        return -2.0
+    if value <= 8:
+        return -4.0
+    return -6.0
 
 
 def compute_short_term_momentum(close_series: pd.Series) -> dict[str, float]:
@@ -331,6 +435,8 @@ def compute_short_term_momentum(close_series: pd.Series) -> dict[str, float]:
             "short_return_15d": float("nan"),
             "short_return_30d": float("nan"),
             "rsi_14": float("nan"),
+            "rsi_change_5d": float("nan"),
+            "rsi_change_10d": float("nan"),
             "short_momentum_score": float("nan"),
         }
 
@@ -353,6 +459,14 @@ def compute_short_term_momentum(close_series: pd.Series) -> dict[str, float]:
         rsi_14 = float(rsi_values[-1])
     else:
         rsi_14 = 50.0
+
+    def rsi_change(days: int) -> float:
+        if len(rsi_values) <= days or not np.isfinite(rsi_values[-1]) or not np.isfinite(rsi_values[-days - 1]):
+            return float("nan")
+        return float(rsi_values[-1] - rsi_values[-days - 1])
+
+    rsi_change_5d = rsi_change(5)
+    rsi_change_10d = rsi_change(10)
 
     recent_returns = [value for value in [short_return_10d, short_return_15d, short_return_30d] if np.isfinite(value)]
     if recent_returns:
@@ -377,6 +491,8 @@ def compute_short_term_momentum(close_series: pd.Series) -> dict[str, float]:
         "short_return_15d": short_return_15d,
         "short_return_30d": short_return_30d,
         "rsi_14": rsi_14,
+        "rsi_change_5d": rsi_change_5d,
+        "rsi_change_10d": rsi_change_10d,
         "short_momentum_score": short_momentum_score,
     }
 
@@ -421,6 +537,185 @@ def compute_trend_confirmation(close_series: pd.Series, sma_50_series: pd.Series
     return {"trend_confirmed": bool(confirmed_mask.iloc[-1]), "trend_confirmed_on": confirmation_date}
 
 
+def compute_experimental_trend(
+    close_series: pd.Series,
+    sma_50_series: pd.Series,
+    sma_200_series: pd.Series,
+) -> dict[str, object]:
+    aligned = pd.concat(
+        [
+            pd.to_numeric(close_series, errors="coerce").rename("close"),
+            pd.to_numeric(sma_50_series, errors="coerce").rename("sma_50"),
+            pd.to_numeric(sma_200_series, errors="coerce").rename("sma_200"),
+        ],
+        axis=1,
+    ).dropna()
+    empty = {
+        "experimental_trend_confirmed": False,
+        "experimental_trend_confirmed_on": None,
+        "days_since_experimental_confirmation": float("nan"),
+        "sma_200_rising_days_20d": 0,
+        "trend_reclaim": False,
+        "trend_event_type": "",
+    }
+    if len(aligned) < TREND_RISING_WINDOW_DAYS + TREND_CONFIRMATION_DAYS:
+        return empty
+
+    rising = aligned["sma_200"].diff().gt(0)
+    rising_count = rising.rolling(TREND_RISING_WINDOW_DAYS, min_periods=TREND_RISING_WINDOW_DAYS).sum()
+    conditions = (
+        aligned["close"].gt(aligned["sma_50"])
+        & aligned["sma_50"].gt(aligned["sma_200"])
+        & rising_count.ge(TREND_RISING_DAYS_REQUIRED)
+    )
+    current_run_length = 0
+    for value in reversed(conditions.tolist()):
+        if not value:
+            break
+        current_run_length += 1
+    confirmed = current_run_length >= TREND_CONFIRMATION_DAYS
+    confirmation_date = None
+    days_since = float("nan")
+    if confirmed:
+        run_start_position = len(aligned) - current_run_length
+        confirmation_date = aligned.index[run_start_position]
+        days_since = float(len(aligned) - run_start_position - 1)
+
+    above = aligned["sma_50"].gt(aligned["sma_200"])
+    crossover_positions = np.flatnonzero((above & ~above.shift(1, fill_value=False)).to_numpy())
+    reclaim = False
+    event_type = ""
+    if len(crossover_positions):
+        latest_cross = int(crossover_positions[-1])
+        below_run = 0
+        cursor = latest_cross - 1
+        while cursor >= 0 and not bool(above.iloc[cursor]):
+            below_run += 1
+            cursor -= 1
+        reclaim = cursor >= 0 and below_run <= TREND_RECLAIM_MAX_DAYS
+        event_type = "reclaim" if reclaim else "crossover"
+
+    return {
+        "experimental_trend_confirmed": bool(confirmed),
+        "experimental_trend_confirmed_on": confirmation_date,
+        "days_since_experimental_confirmation": days_since,
+        "sma_200_rising_days_20d": int(rising.tail(TREND_RISING_WINDOW_DAYS).sum()),
+        "trend_reclaim": bool(reclaim),
+        "trend_event_type": event_type,
+    }
+
+
+def compute_entry_diagnostics(
+    close: pd.Series,
+    volume: pd.Series,
+    atr_series: pd.Series,
+    ema_20_series: pd.Series,
+    sma_50_series: pd.Series,
+    sma_200_series: pd.Series,
+    rsi_series: pd.Series,
+    normalized_slope_200: float,
+) -> dict[str, object]:
+    frame = pd.concat(
+        [
+            close.rename("close"), volume.rename("volume"), atr_series.rename("atr"),
+            ema_20_series.rename("ema_20"), sma_50_series.rename("sma_50"),
+            sma_200_series.rename("sma_200"), rsi_series.rename("rsi"),
+        ], axis=1,
+    ).dropna(subset=["close", "atr", "ema_20", "sma_50", "sma_200"])
+    if frame.empty or not np.isfinite(float(frame["atr"].iloc[-1])) or float(frame["atr"].iloc[-1]) <= 0:
+        return {}
+
+    latest = frame.iloc[-1]
+    current_atr = float(latest["atr"])
+    current_close = float(latest["close"])
+    distance_ema_20_atr = (current_close - float(latest["ema_20"])) / current_atr
+    distance_sma_50_atr = (current_close - float(latest["sma_50"])) / current_atr
+    distance_sma_200_atr = (current_close - float(latest["sma_200"])) / current_atr
+    normalized_atr_pct = current_atr / current_close * 100 if current_close else float("nan")
+
+    recent = frame.iloc[-PULLBACK_LOOKBACK_DAYS:]
+    # A centered three-day median prevents an isolated one-day spike from
+    # becoming the sole anchor for a purported constructive pullback.
+    reference_highs = recent["close"].rolling(3, center=True, min_periods=2).median()
+    peak_position = int(np.argmax(reference_highs.to_numpy()))
+    peak_date = recent.index[peak_position]
+    peak_close = float(reference_highs.iloc[peak_position])
+    peak_atr = float(recent["atr"].iloc[peak_position])
+    pullback = recent.iloc[peak_position:]
+    pullback_duration = len(pullback) - 1
+    pullback_pct = (current_close / peak_close - 1) * 100 if peak_close else float("nan")
+    below_high_current_atr = (peak_close - current_close) / current_atr
+    below_high_peak_atr = (peak_close - current_close) / peak_atr if peak_atr > 0 else float("nan")
+    closes_below_sma_200 = int(pullback["close"].lt(pullback["sma_200"]).sum())
+
+    median_volume = frame["volume"].rolling(LIQUIDITY_LOOKBACK_DAYS, min_periods=5).median()
+    prior_close = frame["close"].shift(1)
+    damaging = (
+        frame["close"].sub(prior_close).le(-1.5 * frame["atr"])
+        & frame["volume"].ge(1.5 * median_volume)
+    )
+    damaging_in_pullback = bool(damaging.loc[damaging.index >= peak_date].any())
+    rsi_context = frame.loc[frame.index >= peak_date - pd.Timedelta(days=15), "rsi"].dropna()
+    peak_rsi = float(rsi_context.max()) if not rsi_context.empty else float("nan")
+    current_rsi = float(frame["rsi"].dropna().iloc[-1]) if frame["rsi"].notna().any() else float("nan")
+    constructive_pullback = bool(
+        normalized_slope_200 > 0
+        and pullback_duration > 0
+        and below_high_current_atr >= PULLBACK_MIN_ATR
+        and closes_below_sma_200 <= PULLBACK_MAX_CLOSES_BELOW_SMA_200
+        and np.isfinite(peak_rsi) and peak_rsi >= 70
+        and np.isfinite(current_rsi) and 40 <= current_rsi <= 65
+    )
+
+    def advance_in_atr(days: int) -> float:
+        if len(frame) <= days:
+            return float("nan")
+        return (current_close - float(frame["close"].iloc[-days - 1])) / current_atr
+
+    extension_series = (frame["close"] - frame["ema_20"]) / frame["atr"]
+    max_ema_20_extension_30d = float(extension_series.tail(30).max())
+    current_extension = max(distance_ema_20_atr, distance_sma_50_atr)
+    verticality = max(
+        value for value in [advance_in_atr(5), advance_in_atr(15), advance_in_atr(30), max_ema_20_extension_30d]
+        if np.isfinite(value)
+    )
+    current_extension_penalty = tiered_extension_penalty(current_extension)
+    # Once current extension has cooled below four ATR, an older vertical move
+    # no longer creates a stale overextension penalty by itself.
+    verticality_penalty = (
+        tiered_extension_penalty(verticality) if distance_ema_20_atr > 4 else 0.0
+    )
+    overextension_penalty = max(-8.0, current_extension_penalty + verticality_penalty)
+    prior_trend = compute_experimental_trend(
+        close.loc[:peak_date], sma_50_series.loc[:peak_date], sma_200_series.loc[:peak_date]
+    )
+
+    return {
+        "ema_20": float(latest["ema_20"]),
+        "normalized_atr_pct": normalized_atr_pct,
+        "distance_ema_20_atr": distance_ema_20_atr,
+        "distance_sma_50_atr": distance_sma_50_atr,
+        "distance_sma_200_atr": distance_sma_200_atr,
+        "atr_below_50d_high_current": below_high_current_atr,
+        "atr_below_50d_high_peak": below_high_peak_atr,
+        "pullback_from_50d_high_pct": pullback_pct,
+        "pullback_peak_date": peak_date,
+        "pullback_duration_days": int(pullback_duration),
+        "pullback_closes_below_sma_200": closes_below_sma_200,
+        "damaging_high_volume_decline": damaging_in_pullback,
+        "pullback_peak_rsi": peak_rsi,
+        "constructive_pullback": constructive_pullback,
+        "trend_confirmed_before_pullback_on": prior_trend["experimental_trend_confirmed_on"],
+        "advance_5d_atr": advance_in_atr(5),
+        "advance_15d_atr": advance_in_atr(15),
+        "advance_30d_atr": advance_in_atr(30),
+        "max_ema_20_extension_30d_atr": max_ema_20_extension_30d,
+        "current_extension_penalty": current_extension_penalty,
+        "verticality_penalty": verticality_penalty,
+        "overextension_penalty": overextension_penalty,
+    }
+
+
 def compute_indicators(history: pd.DataFrame) -> pd.Series:
     close = pd.to_numeric(history["Close"], errors="coerce").dropna()
     high = pd.to_numeric(history["High"], errors="coerce").dropna()
@@ -431,24 +726,35 @@ def compute_indicators(history: pd.DataFrame) -> pd.Series:
         raise ValueError("insufficient history")
 
     atr = talib.ATR(high.to_numpy(), low.to_numpy(), close.to_numpy(), timeperiod=15)
+    ema_20 = talib.EMA(close.to_numpy(), timeperiod=20)
     sma_50 = talib.SMA(close.to_numpy(), timeperiod=50)
     sma_200 = talib.SMA(close.to_numpy(), timeperiod=200)
+    rsi_14_values = talib.RSI(close.to_numpy(), timeperiod=14)
 
     atr_series = pd.Series(atr, index=close.index)
+    ema_20_series = pd.Series(ema_20, index=close.index)
     sma_50_series = pd.Series(sma_50, index=close.index)
     sma_200_series = pd.Series(sma_200, index=close.index)
+    rsi_14_series = pd.Series(rsi_14_values, index=close.index)
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
     latest_close = float(close.iloc[-1])
     atr_15d = float(atr_series.iloc[-1])
-    volume_metrics = compute_volume_metrics(volume, 15)
+    volume_metrics = compute_volume_metrics(volume, 15, close)
     sma_50 = float(sma_50_series.iloc[-1])
     sma_200 = float(sma_200_series.iloc[-1])
 
-    slope_50 = float(np.polyfit(np.arange(len(sma_50_series.dropna())), sma_50_series.dropna().to_numpy(), 1)[0])
-    slope_200 = float(np.polyfit(np.arange(len(sma_200_series.dropna())), sma_200_series.dropna().to_numpy(), 1)[0])
+    slope_50 = compute_raw_slope(sma_50_series)
+    slope_200 = compute_raw_slope(sma_200_series)
+    normalized_slope_50 = compute_normalized_slope(sma_50_series, SLOPE_50_LOOKBACK_DAYS)
+    normalized_slope_200 = compute_normalized_slope(sma_200_series, SLOPE_200_LOOKBACK_DAYS)
     short_term_momentum = compute_short_term_momentum(close)
     trend_confirmation = compute_trend_confirmation(close, sma_50_series, sma_200_series)
+    experimental_trend = compute_experimental_trend(close, sma_50_series, sma_200_series)
+    entry_diagnostics = compute_entry_diagnostics(
+        close, volume, atr_series, ema_20_series, sma_50_series, sma_200_series,
+        rsi_14_series, normalized_slope_200,
+    )
 
     return pd.Series(
         {
@@ -457,18 +763,27 @@ def compute_indicators(history: pd.DataFrame) -> pd.Series:
             "atr_15d": atr_15d,
             "latest_volume": volume_metrics["latest_volume"],
             "avg_volume_15d": volume_metrics["avg_volume_15d"],
+            "mean_volume_20d": volume_metrics["mean_volume_20d"],
+            "median_volume_20d": volume_metrics["median_volume_20d"],
+            "median_dollar_volume_20d": volume_metrics["median_dollar_volume_20d"],
             "volume_1p5x": volume_metrics["latest_volume"] > 1.5 * volume_metrics["avg_volume_15d"],
             "sma_50": sma_50,
             "slope_50": slope_50,
+            "normalized_slope_50_20d": normalized_slope_50,
             "sma_200": sma_200,
             "slope_200": slope_200,
+            "normalized_slope_200_40d": normalized_slope_200,
             "short_return_10d": short_term_momentum["short_return_10d"],
             "short_return_15d": short_term_momentum["short_return_15d"],
             "short_return_30d": short_term_momentum["short_return_30d"],
             "rsi_14": short_term_momentum["rsi_14"],
+            "rsi_change_5d": short_term_momentum["rsi_change_5d"],
+            "rsi_change_10d": short_term_momentum["rsi_change_10d"],
             "short_momentum_score": short_term_momentum["short_momentum_score"],
             "trend_confirmed": trend_confirmation["trend_confirmed"],
             "trend_confirmed_on": trend_confirmation["trend_confirmed_on"],
+            **experimental_trend,
+            **entry_diagnostics,
         }
     )
 
@@ -503,18 +818,53 @@ def build_rankings(tickers: list[str], start_date: str = DEFAULT_START_DATE, end
                     "atr_15d": round(float(indicators["atr_15d"]), 2),
                     "latest_volume": round(float(indicators["latest_volume"]), 2),
                     "avg_volume_15d": round(float(indicators["avg_volume_15d"]), 2),
+                    "mean_volume_20d": round(float(indicators["mean_volume_20d"]), 2),
+                    "median_volume_20d": round(float(indicators["median_volume_20d"]), 2),
+                    "median_dollar_volume_20d": round(float(indicators["median_dollar_volume_20d"]), 2),
                     "volume_1p5x": bool(indicators["volume_1p5x"]),
                     "sma_50": round(float(indicators["sma_50"]), 2),
                     "slope_50": round(float(indicators["slope_50"]), 4),
+                    "normalized_slope_50_20d": round(float(indicators["normalized_slope_50_20d"]), 4),
                     "sma_200": round(float(indicators["sma_200"]), 2),
                     "slope_200": round(float(indicators["slope_200"]), 4),
+                    "normalized_slope_200_40d": round(float(indicators["normalized_slope_200_40d"]), 4),
                     "short_return_10d": round(float(indicators["short_return_10d"]), 2),
                     "short_return_15d": round(float(indicators["short_return_15d"]), 2),
                     "short_return_30d": round(float(indicators["short_return_30d"]), 2),
                     "rsi_14": round(float(indicators["rsi_14"]), 2),
+                    "rsi_change_5d": round(float(indicators["rsi_change_5d"]), 2),
+                    "rsi_change_10d": round(float(indicators["rsi_change_10d"]), 2),
                     "short_momentum_score": round(float(indicators["short_momentum_score"]), 2),
                     "trend_confirmed": bool(indicators["trend_confirmed"]),
                     "trend_confirmed_on": indicators["trend_confirmed_on"].strftime("%Y-%m-%d") if pd.notna(indicators["trend_confirmed_on"]) else None,
+                    "experimental_trend_confirmed": bool(indicators["experimental_trend_confirmed"]),
+                    "experimental_trend_confirmed_on": indicators["experimental_trend_confirmed_on"].strftime("%Y-%m-%d") if pd.notna(indicators["experimental_trend_confirmed_on"]) else None,
+                    "days_since_experimental_confirmation": indicators["days_since_experimental_confirmation"],
+                    "sma_200_rising_days_20d": int(indicators["sma_200_rising_days_20d"]),
+                    "trend_reclaim": bool(indicators["trend_reclaim"]),
+                    "trend_event_type": str(indicators["trend_event_type"]),
+                    "ema_20": round(float(indicators.get("ema_20", float("nan"))), 2),
+                    "normalized_atr_pct": round(float(indicators.get("normalized_atr_pct", float("nan"))), 2),
+                    "distance_ema_20_atr": round(float(indicators.get("distance_ema_20_atr", float("nan"))), 2),
+                    "distance_sma_50_atr": round(float(indicators.get("distance_sma_50_atr", float("nan"))), 2),
+                    "distance_sma_200_atr": round(float(indicators.get("distance_sma_200_atr", float("nan"))), 2),
+                    "atr_below_50d_high_current": round(float(indicators.get("atr_below_50d_high_current", float("nan"))), 2),
+                    "atr_below_50d_high_peak": round(float(indicators.get("atr_below_50d_high_peak", float("nan"))), 2),
+                    "pullback_from_50d_high_pct": round(float(indicators.get("pullback_from_50d_high_pct", float("nan"))), 2),
+                    "pullback_peak_date": indicators["pullback_peak_date"].strftime("%Y-%m-%d") if pd.notna(indicators.get("pullback_peak_date")) else None,
+                    "pullback_duration_days": indicators.get("pullback_duration_days", float("nan")),
+                    "pullback_closes_below_sma_200": indicators.get("pullback_closes_below_sma_200", float("nan")),
+                    "damaging_high_volume_decline": bool(indicators.get("damaging_high_volume_decline", False)),
+                    "pullback_peak_rsi": round(float(indicators.get("pullback_peak_rsi", float("nan"))), 2),
+                    "constructive_pullback": bool(indicators.get("constructive_pullback", False)),
+                    "trend_confirmed_before_pullback_on": indicators["trend_confirmed_before_pullback_on"].strftime("%Y-%m-%d") if pd.notna(indicators.get("trend_confirmed_before_pullback_on")) else None,
+                    "advance_5d_atr": round(float(indicators.get("advance_5d_atr", float("nan"))), 2),
+                    "advance_15d_atr": round(float(indicators.get("advance_15d_atr", float("nan"))), 2),
+                    "advance_30d_atr": round(float(indicators.get("advance_30d_atr", float("nan"))), 2),
+                    "max_ema_20_extension_30d_atr": round(float(indicators.get("max_ema_20_extension_30d_atr", float("nan"))), 2),
+                    "current_extension_penalty": float(indicators.get("current_extension_penalty", 0.0)),
+                    "verticality_penalty": float(indicators.get("verticality_penalty", 0.0)),
+                    "overextension_penalty": float(indicators.get("overextension_penalty", 0.0)),
                     "data_quality_flag": bool(quality["data_quality_flag"]),
                     "data_quality_reason": str(quality["data_quality_reason"]),
                     "split_events_detected": int(quality.get("split_events_detected", 0)),
@@ -523,6 +873,8 @@ def build_rankings(tickers: list[str], start_date: str = DEFAULT_START_DATE, end
                     "max_daily_gain": round(float(quality["max_daily_gain"]), 2),
                     "max_daily_loss": round(float(quality["max_daily_loss"]), 2),
                     "latest_price": round(float(latest), 2),
+                    "1m": round(compute_period_performance(close_series, LOOKBACK_DAYS["1m"]), 2),
+                    "3m": round(compute_period_performance(close_series, LOOKBACK_DAYS["3m"]), 2),
                     "6m": round(compute_period_performance(close_series.iloc[-LOOKBACK_DAYS["6m"] :], LOOKBACK_DAYS["6m"]), 2),
                     "12m": round(compute_period_performance(close_series.iloc[-LOOKBACK_DAYS["12m"] :], LOOKBACK_DAYS["12m"]), 2),
                     "2y": round(compute_period_performance(close_series.iloc[-LOOKBACK_DAYS["2y"] :], LOOKBACK_DAYS["2y"]), 2),
@@ -567,7 +919,7 @@ def build_rankings(tickers: list[str], start_date: str = DEFAULT_START_DATE, end
     return rankings, failures
 
 
-def build_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def build_legacy_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
     frames: dict[str, pd.DataFrame] = {}
 
     momentum = rankings.copy()
@@ -676,6 +1028,293 @@ def build_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return frames
 
 
+def percentile_against_clean(values: pd.Series, clean_values: pd.Series) -> pd.Series:
+    reference = pd.to_numeric(clean_values, errors="coerce").dropna().sort_values().to_numpy()
+    numeric = pd.to_numeric(values, errors="coerce")
+    if len(reference) == 0:
+        return pd.Series(float("nan"), index=values.index)
+    return numeric.apply(
+        lambda value: float(np.searchsorted(reference, value, side="right") / len(reference) * 100)
+        if np.isfinite(value) else float("nan")
+    )
+
+
+def build_shadow_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if rankings.empty:
+        return {
+            "ShadowMomentum": pd.DataFrame(),
+            "ShadowTrend": pd.DataFrame(),
+            "ShadowRelative": pd.DataFrame(),
+            "Diagnostics": pd.DataFrame(),
+        }
+
+    work = rankings.copy()
+    defaults: dict[str, object] = {
+        "data_quality_flag": False,
+        "median_dollar_volume_20d": float("nan"),
+        "short_momentum_score": 0.0,
+        "short_return_10d": 0.0,
+        "short_return_15d": 0.0,
+        "short_return_30d": 0.0,
+        "rsi_14": 50.0,
+        "rsi_change_5d": float("nan"),
+        "rsi_change_10d": float("nan"),
+        "overextension_penalty": 0.0,
+        "constructive_pullback": False,
+        "experimental_trend_confirmed": False,
+        "experimental_trend_confirmed_on": None,
+        "days_since_experimental_confirmation": float("nan"),
+        "sma_200_rising_days_20d": 0,
+        "normalized_slope_50_20d": 0.0,
+        "normalized_slope_200_40d": 0.0,
+        "trend_reclaim": False,
+        "trend_event_type": "",
+    }
+    for column, default in defaults.items():
+        if column not in work.columns:
+            work[column] = default
+    if "1m" not in work.columns:
+        work["1m"] = work.get("6m", 0.0)
+    if "3m" not in work.columns:
+        work["3m"] = work.get("6m", 0.0)
+    work["data_quality_flag"] = work["data_quality_flag"].fillna(False).astype(bool)
+    clean = work.loc[~work["data_quality_flag"]]
+    reference = clean if not clean.empty else work
+
+    work["liquidity_adjustment"] = work["median_dollar_volume_20d"].apply(liquidity_score_adjustment)
+    work["price_adjustment"] = work["closing_price"].apply(price_score_adjustment)
+    work["rsi_penalty"] = [
+        rsi_score_penalty(float(rsi), float(change))
+        for rsi, change in zip(work["rsi_14"], work["rsi_change_5d"])
+    ]
+    work["gross_penalty"] = (
+        work["price_adjustment"].clip(upper=0)
+        + work["liquidity_adjustment"].clip(upper=0)
+        + work["rsi_penalty"].clip(upper=0)
+        + work["overextension_penalty"].clip(upper=0)
+    )
+    work["liquidity_bonus"] = work["liquidity_adjustment"].clip(lower=0)
+    work["total_net_adjustment"] = (
+        work["liquidity_adjustment"] + work["price_adjustment"]
+        + work["rsi_penalty"] + work["overextension_penalty"]
+    )
+
+    current_frames = build_legacy_method_sheets(rankings)
+    current_rank_maps = {
+        name: {ticker: rank for rank, ticker in enumerate(frame["ticker"], start=1)}
+        for name, frame in current_frames.items()
+    }
+
+    current_momentum = (
+        0.5 * work["short_momentum_score"]
+        + 0.35 * work["short_return_10d"]
+        + 0.15 * work["short_return_15d"]
+    )
+    work["momentum_current_score"] = current_momentum
+    work["momentum_base_score"] = percentile_against_clean(current_momentum, current_momentum.loc[reference.index])
+    work["momentum_adjusted_score"] = (
+        work["momentum_base_score"] + work["liquidity_adjustment"] + work["price_adjustment"]
+        + work["rsi_penalty"] + work["overextension_penalty"]
+    ).clip(0, 100)
+
+    structure = (
+        work["closing_price"].gt(work["sma_50"])
+        & work["sma_50"].gt(work["sma_200"])
+    ).astype(float)
+    rising_component = (
+        pd.to_numeric(work["sma_200_rising_days_20d"], errors="coerce")
+        .fillna(0).clip(upper=TREND_RISING_DAYS_REQUIRED) / TREND_RISING_DAYS_REQUIRED * 10
+    )
+    days_since = pd.to_numeric(work["days_since_experimental_confirmation"], errors="coerce")
+    freshness = (5 * (1 - days_since / LOOKBACK_DAYS["6m"])).clip(lower=0, upper=5).fillna(0)
+    slope_50_percentile = percentile_against_clean(
+        work["normalized_slope_50_20d"], reference["normalized_slope_50_20d"]
+    )
+    slope_200_percentile = percentile_against_clean(
+        work["normalized_slope_200_40d"], reference["normalized_slope_200_40d"]
+    )
+    work["trend_base_score"] = (
+        work["experimental_trend_confirmed"].fillna(False).astype(float) * 40
+        + structure * 10 + rising_component
+        + slope_50_percentile * 0.15 + slope_200_percentile * 0.20 + freshness
+    ).clip(0, 100)
+    work["trend_adjusted_score"] = (
+        work["trend_base_score"] + work["liquidity_adjustment"] + work["price_adjustment"]
+    ).clip(0, 100)
+
+    weights = {"6m": 0.40, "3m": 0.25, "12m": 0.20, "1m": 0.15}
+    for period in weights:
+        work[f"{period}_percentile"] = percentile_against_clean(work[period], reference[period])
+    work["relative_strength_base_score"] = sum(
+        weight * work[f"{period}_percentile"] for period, weight in weights.items()
+    )
+    work["relative_strength_adjusted_score"] = (
+        work["relative_strength_base_score"] + work["liquidity_adjustment"]
+        + work["price_adjustment"] + work["rsi_penalty"] + work["overextension_penalty"]
+    ).clip(0, 100)
+
+    def make_shadow(method: str, score_column: str, columns: list[str]) -> pd.DataFrame:
+        frame = work.copy()
+        if method == "TrendConfirmation":
+            frame["gross_penalty"] = (
+                frame["price_adjustment"].clip(upper=0)
+                + frame["liquidity_adjustment"].clip(upper=0)
+            )
+            frame["liquidity_bonus"] = frame["liquidity_adjustment"].clip(lower=0)
+            frame["total_net_adjustment"] = (
+                frame["liquidity_adjustment"] + frame["price_adjustment"]
+            )
+        frame["current_rank"] = frame["ticker"].map(current_rank_maps[method])
+        frame = frame.sort_values(
+            ["data_quality_flag", score_column], ascending=[True, False]
+        ).reset_index(drop=True)
+        frame["experimental_rank"] = np.arange(1, len(frame) + 1)
+        frame["rank_change"] = frame["current_rank"] - frame["experimental_rank"]
+        selected = ["ticker", "current_rank", "experimental_rank", "rank_change"] + columns
+        return frame[[column for column in selected if column in frame.columns]]
+
+    common_columns = [
+        "closing_price", "median_dollar_volume_20d", "liquidity_adjustment",
+        "price_adjustment", "gross_penalty", "liquidity_bonus", "total_net_adjustment",
+        "constructive_pullback", "data_quality_flag",
+    ]
+    momentum = make_shadow(
+        "MomentumLeader", "momentum_adjusted_score",
+        ["momentum_current_score", "momentum_base_score", "momentum_adjusted_score",
+         "rsi_14", "rsi_change_5d", "rsi_penalty", "overextension_penalty"] + common_columns,
+    )
+    trend = make_shadow(
+        "TrendConfirmation", "trend_adjusted_score",
+        ["trend_base_score", "trend_adjusted_score", "experimental_trend_confirmed",
+         "experimental_trend_confirmed_on", "days_since_experimental_confirmation",
+         "sma_200_rising_days_20d", "trend_reclaim", "trend_event_type",
+         "normalized_slope_50_20d", "normalized_slope_200_40d"] + common_columns,
+    )
+    relative = make_shadow(
+        "RelativeStrength", "relative_strength_adjusted_score",
+        ["relative_strength_base_score", "relative_strength_adjusted_score",
+         "1m", "1m_percentile", "3m", "3m_percentile", "6m", "6m_percentile",
+         "12m", "12m_percentile", "rsi_penalty", "overextension_penalty"] + common_columns,
+    )
+    diagnostic_columns = [
+        "ticker", "as_of_date", "closing_price", "mean_volume_20d", "median_volume_20d",
+        "median_dollar_volume_20d", "ema_20", "normalized_atr_pct",
+        "normalized_slope_50_20d", "normalized_slope_200_40d",
+        "distance_ema_20_atr", "distance_sma_50_atr", "distance_sma_200_atr",
+        "atr_below_50d_high_current", "atr_below_50d_high_peak",
+        "pullback_from_50d_high_pct", "pullback_peak_date", "pullback_duration_days",
+        "pullback_closes_below_sma_200", "damaging_high_volume_decline",
+        "pullback_peak_rsi", "constructive_pullback", "trend_confirmed_before_pullback_on",
+        "advance_5d_atr",
+        "advance_15d_atr", "advance_30d_atr", "max_ema_20_extension_30d_atr",
+        "current_extension_penalty", "verticality_penalty", "overextension_penalty",
+        "rsi_14", "rsi_change_5d", "rsi_change_10d", "rsi_penalty",
+        "data_quality_flag", "data_quality_reason",
+    ]
+    return {
+        "ShadowMomentum": momentum,
+        "ShadowTrend": trend,
+        "ShadowRelative": relative,
+        "Diagnostics": work[[column for column in diagnostic_columns if column in work.columns]],
+    }
+
+
+def build_method_sheets(rankings: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Build the production sheets using the approved adjusted ranking systems."""
+    if rankings.empty:
+        return {}
+    shadows = build_shadow_sheets(rankings)
+
+    def combine(shadow_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        shadow = shadows[shadow_name].reset_index(drop=True)
+        indexed = rankings.drop_duplicates("ticker").set_index("ticker")
+        frame = indexed.reindex(shadow["ticker"]).reset_index()
+        for column in shadow.columns:
+            if column != "ticker":
+                frame[column] = shadow[column].to_numpy()
+        frame["previous_system_rank"] = frame["current_rank"]
+        frame["rank_change_vs_previous"] = frame["rank_change"]
+        return frame, shadow
+
+    momentum, _ = combine("ShadowMomentum")
+    momentum["method"] = METHODS["MomentumLeader"]
+    momentum["momentum_score"] = momentum["momentum_adjusted_score"]
+    momentum_columns = [
+        "ticker", "method", "momentum_score", "momentum_base_score",
+        "total_net_adjustment", "gross_penalty", "liquidity_bonus",
+        "previous_system_rank", "rank_change_vs_previous", "short_momentum_score",
+        "short_return_10d", "short_return_15d", "short_return_30d", "rsi_14",
+        "rsi_change_5d", "rsi_penalty", "overextension_penalty", "closing_price",
+        "atr_15d", "median_dollar_volume_20d", "liquidity_adjustment",
+        "price_adjustment", "volume_1p5x", "constructive_pullback", "data_quality_flag",
+        "data_quality_reason",
+    ]
+
+    trend, _ = combine("ShadowTrend")
+    trend["method"] = METHODS["TrendConfirmation"]
+    trend["trend_score"] = trend["trend_adjusted_score"]
+    trend["trend_flag"] = trend["experimental_trend_confirmed"].fillna(False).astype(int)
+    trend["trend_confirmed"] = trend["experimental_trend_confirmed"].fillna(False).astype(bool)
+    trend["trend_confirmed_on"] = trend["experimental_trend_confirmed_on"]
+    trend_columns = [
+        "ticker", "method", "trend_score", "trend_base_score",
+        "total_net_adjustment", "gross_penalty", "liquidity_bonus",
+        "previous_system_rank", "rank_change_vs_previous", "trend_flag",
+        "trend_confirmed", "trend_confirmed_on", "days_since_experimental_confirmation",
+        "sma_200_rising_days_20d", "trend_reclaim", "trend_event_type",
+        "normalized_slope_50_20d", "normalized_slope_200_40d", "closing_price",
+        "sma_50", "sma_200", "median_dollar_volume_20d", "liquidity_adjustment",
+        "price_adjustment", "volume_1p5x", "constructive_pullback", "data_quality_flag",
+        "data_quality_reason",
+    ]
+
+    relative, _ = combine("ShadowRelative")
+    relative["method"] = METHODS["RelativeStrength"]
+    relative["relative_strength"] = relative["relative_strength_adjusted_score"]
+    relative_columns = [
+        "ticker", "method", "relative_strength", "relative_strength_base_score",
+        "total_net_adjustment", "gross_penalty", "liquidity_bonus",
+        "previous_system_rank", "rank_change_vs_previous", "1m", "1m_percentile",
+        "3m", "3m_percentile", "6m", "6m_percentile", "12m", "12m_percentile",
+        "rsi_14", "rsi_penalty", "overextension_penalty", "closing_price",
+        "median_dollar_volume_20d", "liquidity_adjustment", "price_adjustment",
+        "volume_1p5x", "constructive_pullback", "data_quality_flag", "data_quality_reason",
+    ]
+    return {
+        "MomentumLeader": momentum[[column for column in momentum_columns if column in momentum.columns]],
+        "TrendConfirmation": trend[[column for column in trend_columns if column in trend.columns]],
+        "RelativeStrength": relative[[column for column in relative_columns if column in relative.columns]],
+    }
+
+
+def write_shadow_workbook(
+    rankings: pd.DataFrame,
+    failures: list[tuple[str, str]],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    definitions = pd.DataFrame(
+        [
+            ("Status", "Experimental only; production list scores and order are unchanged."),
+            ("Liquidity", "20-day median dollar volume adjustments: <-$100k -8; $100k-$500k -3; $500k-$2m 0; >$2m +2."),
+            ("Price", "Price adjustments: <$1 -8; $1-$3 -4; $3-$5 -2; >=$5 0."),
+            ("Trend", "200-day SMA rising at least 15 of 20 days; structure persists 5 days; reclaim interruption <=10 days."),
+            ("Slopes", "50-day SMA over 20 days and 200-day SMA over 40 days, expressed as percent per trading day."),
+            ("Constructive pullback", "At least 3 current ATR below a three-day-median 50-day high; positive 200-day slope; <=3 closes below SMA200; peak RSI >=70 and current RSI 40-65."),
+            ("Relative strength", "Percentile blend: 6m 40%, 3m 25%, 12m 20%, 1m 15%."),
+            ("Risk-to-reward", "Reserved for a later phase; no score or trade-quality label is produced."),
+        ], columns=["component", "definition"]
+    )
+    with pd.ExcelWriter(output_path) as writer:
+        for name, frame in build_shadow_sheets(rankings).items():
+            frame.to_excel(writer, sheet_name=name, index=False)
+        definitions.to_excel(writer, sheet_name="Definitions", index=False)
+        if failures:
+            pd.DataFrame(failures, columns=["ticker", "error"]).to_excel(
+                writer, sheet_name="Failed_tickers", index=False
+            )
+
+
 def write_outputs(rankings: pd.DataFrame, failures: list[tuple[str, str]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -699,6 +1338,9 @@ def write_outputs(rankings: pd.DataFrame, failures: list[tuple[str, str]], outpu
             method_frames = build_method_sheets(rankings)
             for method_name, method_frame in method_frames.items():
                 method_frame.to_excel(writer, sheet_name=method_name, index=False)
+
+            shadow_frames = build_shadow_sheets(rankings)
+            shadow_frames["Diagnostics"].to_excel(writer, sheet_name="Diagnostics", index=False)
 
             if not rankings.empty and "data_quality_flag" in rankings.columns:
                 review_mask = (
@@ -777,6 +1419,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Rank biotech stocks by recent performance")
     parser.add_argument("--tickers", required=True, help="Path to a CSV file with a ticker column")
     parser.add_argument("--output", default="output/biotech_rankings.xlsx", help="Path to save results (CSV or XLSX)")
+    parser.add_argument(
+        "--shadow-output",
+        default="output/biotech_rankings_shadow.xlsx",
+        help="Path to save the experimental side-by-side shadow workbook",
+    )
     parser.add_argument("--start-date", default=DEFAULT_START_DATE, help="Start date for downloading historical data")
     parser.add_argument("--discover", action="store_true", help="Attempt to discover an automated biotech ticker universe")
     parser.add_argument("--discovered-output", default="output/discovered_tickers.csv", help="Where to save discovered tickers")
@@ -809,8 +1456,10 @@ def main() -> None:
     rankings, failures = build_rankings(tickers, start_date=args.start_date)
     output_path = Path(args.output)
     write_outputs(rankings, failures, output_path)
+    write_shadow_workbook(rankings, failures, Path(args.shadow_output))
 
     print(f"Generated {len(rankings)} ranked tickers and {len(failures)} failed downloads")
+    print(f"Generated experimental shadow workbook at {args.shadow_output}")
     print(rankings.head(10).to_string(index=False))
 
 

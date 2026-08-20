@@ -15,18 +15,16 @@ import pandas as pd
 
 SHEETS = {
     "MomentumLeader": (
-        "This list uses a shorter-term momentum view built from 10-, 15-, and "
-        "30-day returns plus RSI. The score gives extra weight to the 10-day "
-        "and 15-day moves to favor names that may still be near an entry point."
+        "This list ranks short-term momentum, then applies transparent liquidity, "
+        "share-price, RSI, and ATR-based overextension adjustments."
     ),
     "TrendConfirmation": (
-        "This list favors names above both the 50-day and 200-day averages with "
-        "positive slope. A trend flag of 1 means the stock is currently in the "
-        "confirmed bullish trend setup."
+        "This list favors a persistent 50/200-day bullish structure, a recently "
+        "rising 200-day average, normalized slopes, and confirmation freshness."
     ),
     "RelativeStrength": (
-        "This list compares each stock's performance with the median result for "
-        "the biotech universe over the same periods and highlights outperformers."
+        "This list blends 1-, 3-, 6-, and 12-month universe percentiles, then "
+        "applies transparent liquidity, share-price, RSI, and extension adjustments."
     ),
 }
 
