@@ -48,3 +48,12 @@ def test_workbook_payload_rejects_missing_sheet(tmp_path):
 
     with pytest.raises(ValueError, match="missing required sheets"):
         workbook_payload(workbook)
+
+
+def test_dashboard_preserves_current_rank_when_filtering():
+    app_script = (Path(__file__).parents[1] / "site" / "app.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".map((row, index) => ({ row, currentRank: index + 1 }))" in app_script
+    assert '[["Rank", currentRank]' in app_script
