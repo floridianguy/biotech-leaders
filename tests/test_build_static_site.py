@@ -57,3 +57,11 @@ def test_dashboard_preserves_current_rank_when_filtering():
 
     assert ".map((row, index) => ({ row, currentRank: index + 1 }))" in app_script
     assert '[["Rank", currentRank]' in app_script
+
+
+def test_dashboard_versions_javascript_asset_to_avoid_stale_rank_logic():
+    index_html = (Path(__file__).parents[1] / "site" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'src="app.js?v=20260820-rank-fix"' in index_html
